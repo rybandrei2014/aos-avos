@@ -634,7 +634,9 @@ static int audiotrack_close(audio_ctx_t **pat)
 		at->presentation_thread_started = 0;
 	}
 
-	if (at->init) {
+	// A failed track rebuild leaves init == 0 with stale global references
+	// (notably jbuffer), so the JNI cleanup must run for those too.
+	if (at->init || at->jbuffer) {
 		// Attach close thread to JVM if not already attached.
 		// Track whether we attached it so we can detach afterwards.
 		int close_thread_attached = 0;
@@ -653,16 +655,20 @@ static int audiotrack_close(audio_ctx_t **pat)
 		}
 		at->env = env;
 
-		int underrun_count = call_int_method(at, "getUnderrunCount", "()I");
-		if (underrun_count > 0)
-			ERR LOG("Underrun count: %d", underrun_count);
+		if (at->init) {
+			int underrun_count = call_int_method(at, "getUnderrunCount", "()I");
+			if (underrun_count > 0)
+				ERR LOG("Underrun count: %d", underrun_count);
 
-		audiotrack_observe_route(at, 0);
-		call_void_method(at, "release", "()V");
-		(*at->env)->DeleteGlobalRef(at->env, at->obj);
+			audiotrack_observe_route(at, 0);
+			call_void_method(at, "release", "()V");
+			(*at->env)->DeleteGlobalRef(at->env, at->obj);
+		}
 		at->obj = NULL;  // Prevent use-after-free
-		(*at->env)->DeleteGlobalRef(at->env, at->jbuffer);
-		at->jbuffer = NULL;
+		if (at->jbuffer) {
+			(*at->env)->DeleteGlobalRef(at->env, at->jbuffer);
+			at->jbuffer = NULL;
+		}
 		(*at->env)->DeleteGlobalRef(at->env, at->audiotrackClass);
 		(*at->env)->DeleteGlobalRef(at->env, at->audiosystemClass);
 		(*at->env)->DeleteGlobalRef(at->env, at->playbackParamsClass);
@@ -1059,7 +1065,8 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 			rate, output_channels, format, at->passthrough, as, using_atempo);
 		if (!using_atempo && is_audio_speed_enabled && at->passthrough == 0 &&
 			device_get_android_api() >= 23 && fabsf(as - 1.0f) > 1e-6f && at->obj) {
-			jobject playbackParams;
+			jobject playbackParams = NULL;
+			jobject spedParams = NULL;
 			jthrowable exception;
 
 			DBG LOG("audiotrack_set_output_params: updating PlaybackParams on existing track");
@@ -1070,8 +1077,13 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 				ERR LOG("exception during getPlaybackParams on existing track");
 				(*at->env)->ExceptionDescribe(at->env);
 				(*at->env)->ExceptionClear(at->env);
+				if (playbackParams)
+					(*at->env)->DeleteLocalRef(at->env, playbackParams);
 			} else {
-				(*at->env)->CallObjectMethod(at->env, playbackParams,
+				int ok = 0;
+				// JNI always returns a fresh local reference, even when
+				// PlaybackParams.setSpeed() returns this.
+				spedParams = (*at->env)->CallObjectMethod(at->env, playbackParams,
 					(*at->env)->GetMethodID(at->env, at->playbackParamsClass, "setSpeed", "(F)Landroid/media/PlaybackParams;"), as);
 				exception = (*at->env)->ExceptionOccurred(at->env);
 				if (exception) {
@@ -1089,9 +1101,14 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 					} else {
 						DBG LOG("audiotrack_set_output_params: PlaybackParams updated on existing track speed=%.3f rate=%d channels=%d frame_size=%zu",
 							as, rate, output_channels, frame_size);
-						return 0;
+						ok = 1;
 					}
 				}
+				if (spedParams)
+					(*at->env)->DeleteLocalRef(at->env, spedParams);
+				(*at->env)->DeleteLocalRef(at->env, playbackParams);
+				if (ok)
+					return 0;
 			}
 		} else {
 			DBG LOG("audiotrack_set_output_params: same_config reuse without speed update using_atempo=%d speed_enabled=%d passthrough=%d api=%d speed=%.3f obj=%p",
@@ -1120,6 +1137,12 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 
 		at->obj = NULL;
 		at->init = 0;
+		// The new track gets a fresh byte[] below; without this release the old
+		// global reference pins it (and its Java buffer) for the whole session.
+		if (at->jbuffer) {
+			(*at->env)->DeleteGlobalRef(at->env, at->jbuffer);
+			at->jbuffer = NULL;
+		}
 		pthread_mutex_unlock(&at->presentation_mutex);
 		at->applied_passthrough = -1;
 		at->applied_spatialization_behavior = -1;
@@ -1343,7 +1366,8 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 		(*at->env)->DeleteLocalRef(at->env, audioFormatObj);
 	}
 
-	jobject playbackParams;
+	jobject playbackParams = NULL;
+	jobject spedParams = NULL;
 
 	// Skip AudioTrack playback rate if using atempo filter (speed is handled in PCM resampling)
 	// Note: using_atempo was already declared earlier in this function
@@ -1356,7 +1380,9 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 		DBG LOG( "audio_interface_audiotrack_java:audiotrack_set_output_params getPlaybackParams returned, calling setSpeed");
 
 		// change that audioparam's speed
-		(*at->env)->CallObjectMethod(at->env, playbackParams,
+		// JNI always returns a fresh local reference, even when
+		// PlaybackParams.setSpeed() returns this.
+		spedParams = (*at->env)->CallObjectMethod(at->env, playbackParams,
 				(*at->env)->GetMethodID(at->env, at->playbackParamsClass, "setSpeed", "(F)Landroid/media/PlaybackParams;"), as);
 		DBG LOG( "audio_interface_audiotrack_java:audiotrack_set_output_params setSpeed completed");
 
@@ -1385,10 +1411,14 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 		} else {
 			DBG LOG( "audio_interface_audiotrack_java:audiotrack_set_output_params setPlaybackParams SUCCESS - audio speed should be %.2fx", as);
 		}
-	} else {
-		DBG LOG( "audio_interface_audiotrack_java:audiotrack_set_output_params not applying setSpeed on AudioTrack PlaybackParams (failed=%d, is_enabled=%d, passthrough=%d, api=%d, speed_diff=%.3f)",
-			failed, is_audio_speed_enabled, at->passthrough, device_get_android_api(), fabsf(as - 1.0f));
-	}
+		} else {
+			DBG LOG( "audio_interface_audiotrack_java:audiotrack_set_output_params not applying setSpeed on AudioTrack PlaybackParams (failed=%d, is_enabled=%d, passthrough=%d, api=%d, speed_diff=%.3f)",
+				failed, is_audio_speed_enabled, at->passthrough, device_get_android_api(), fabsf(as - 1.0f));
+		}
+		if (spedParams)
+			(*at->env)->DeleteLocalRef(at->env, spedParams);
+		if (playbackParams)
+			(*at->env)->DeleteLocalRef(at->env, playbackParams);
 
 	if (!failed) {
 		pthread_mutex_lock(&at->presentation_mutex);
@@ -1456,9 +1486,23 @@ static int audiotrack_set_output_params(audio_ctx_t *at, int rate, int channels,
 		//frame_size reported can be false for compressed formats
 		at->frame_count = at->buf_size / at->frame_size; // number of frames in the buffer
 		DBG LOG("len buf size %d frc %d frs %d nbChs %d", at->buf_size, at->frame_count, at->frame_size, at->channel_count);
-		if (!failed)
-			at->jbuffer = (jbyteArray) (*at->env)->NewGlobalRef(at->env, (*at->env)->NewByteArray(at->env, at->buf_size));
+		if (!failed) {
+			jbyteArray array = (jbyteArray) (*at->env)->NewByteArray(at->env, at->buf_size);
+			// The reinit path above already dropped the previous global; this
+			// also covers the fallback re-entries that never reach it.
+			if (at->jbuffer)
+				(*at->env)->DeleteGlobalRef(at->env, at->jbuffer);
+			at->jbuffer = array ? (jbyteArray) (*at->env)->NewGlobalRef(at->env, array) : NULL;
+			if (array)
+				(*at->env)->DeleteLocalRef(at->env, array);
+		}
 	}
+
+	// The created track lives on through at->obj (global). Drop the local
+	// reference here; the retry recursion and the failure return below would
+	// otherwise strand it in this thread's reference table.
+	if (audioTrack)
+		(*at->env)->DeleteLocalRef(at->env, audioTrack);
 
 	if (failed && reinit && !ac3_recoding_enabled) {
 		msec_sleep( 100 );
@@ -3189,12 +3233,15 @@ DBG	LOG("audio_interface_audiotrack_java:audiotrack_change_audio_speed speed=%f"
 			DBG LOG( "audio_interface_audiotrack_java:audiotrack_change_audio_speed playbackparams fetched" );
 
 			// change that audioparam's speed
-			( *myEnv )
-				->CallObjectMethod(
-					myEnv, playbackParams,
-					( *myEnv )
-						->GetMethodID( myEnv, at->playbackParamsClass, "setSpeed", "(F)Landroid/media/PlaybackParams;" ),
-					speed );
+			// JNI always returns a fresh local reference, even when
+			// PlaybackParams.setSpeed() returns this.
+			jobject spedParams =
+				( *myEnv )
+					->CallObjectMethod(
+						myEnv, playbackParams,
+						( *myEnv )
+							->GetMethodID( myEnv, at->playbackParamsClass, "setSpeed", "(F)Landroid/media/PlaybackParams;" ),
+						speed );
 
 			DBG LOG( "audio_interface_audiotrack_java:audiotrack_change_audio_speed setspeed done" );
 
@@ -3205,6 +3252,8 @@ DBG	LOG("audio_interface_audiotrack_java:audiotrack_change_audio_speed speed=%f"
 				( *myEnv )->ExceptionClear( myEnv );
 				failed = 1;
 			}
+			if( spedParams )
+				( *myEnv )->DeleteLocalRef( myEnv, spedParams );
 		}
 
 		// set audiotrack's audioparams
