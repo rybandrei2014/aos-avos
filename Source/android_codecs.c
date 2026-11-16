@@ -140,6 +140,9 @@ int acodecs_is_type_supported(const char *type, int is_sw_allowed)
 		ERR serprintf("!!!EXCEPTION: acodecs_init:acodecs_is_type_supported CallStaticBooleanMethod\n");
 		(*env)->ExceptionDescribe(env);
 		(*env)->ExceptionClear(env);
+		(*env)->DeleteLocalRef(env, string);
+		if (willDetach)
+			(*myVm)->DetachCurrentThread(myVm);
 		return 1;
 	}
 
@@ -175,7 +178,8 @@ const char* acodecs_get_for_profile(const char *mime_type, int profile)
 		ERR serprintf("!!!EXCEPTION: acodecs_init:acodecs_is_type_supported CallStaticBooleanMethod\n");
 		(*env)->ExceptionDescribe(env);
 		(*env)->ExceptionClear(env);
-		return NULL;
+		(*env)->DeleteLocalRef(env, string);
+		goto end;
 	}
 	(*env)->DeleteLocalRef(env, string);
 
@@ -190,6 +194,9 @@ const char* acodecs_get_for_profile(const char *mime_type, int profile)
 
 	
 end:
+	// The Java String would otherwise stay pinned by a local reference for
+	// the whole life of these long-lived stream/parser threads.
+	(*env)->DeleteLocalRef(env, result);
 	if (willDetach)
 		(*myVm)->DetachCurrentThread(myVm);
 
